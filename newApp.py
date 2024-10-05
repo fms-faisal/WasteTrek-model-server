@@ -1,16 +1,17 @@
 import os
 import torch
 from flask import Flask, request, jsonify
+import PIL
 from PIL import Image, ImageDraw
 import torchvision.transforms as transforms
 from werkzeug.utils import secure_filename
 import torchvision
-from torchvision import transforms
 from torchvision.ops import nms
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, FasterRCNN_ResNet50_FPN_Weights
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.transforms import functional as F
+import cv2
+import numpy as np
 
-import torch
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 # Load the trained model
@@ -43,11 +44,8 @@ def custom_nms(outputs, iou_threshold=0.5):
         processed_outputs.append(output)
     return processed_outputs
 
-# Visualize predictions and save images
-def visualize_predictions(model, image_path, save_path, iou_threshold=0.5):
-    image = Image.open(image_path).convert("RGB")
-    image_tensor = F.to_tensor(image).unsqueeze(0).to(device)
-
+# Visualize predictions and draw bounding boxes
+def visualize_predictions(model, image_tensor, frame_number, iou_threshold=0.5):
     with torch.no_grad():
         prediction = model(image_tensor)
 
@@ -59,16 +57,19 @@ def visualize_predictions(model, image_path, save_path, iou_threshold=0.5):
     img_pil = Image.fromarray((img_np * 255).astype('uint8'))
     draw = ImageDraw.Draw(img_pil)
 
-    # Draw predicted boxes in red
-    for box, score in zip(prediction[0]['boxes'], prediction[0]['scores']):
-        if score > 0.5:  # You can adjust this threshold if needed
-            box = box.cpu().numpy()
-            x_min, y_min, x_max, y_max = box
-            draw.rectangle([x_min, y_min, x_max, y_max], outline='red', width=2)
+    if len(prediction[0]['boxes']) == 0:
+        print(f"No garbage found in frame {frame_number}")
+    else:
+        print(f"Garbage found in frame {frame_number}")
+        # Draw predicted boxes in red
+        for box, score in zip(prediction[0]['boxes'], prediction[0]['scores']):
+            if score > 0.5:  # Threshold for drawing the box
+                box = box.cpu().numpy()
+                x_min, y_min, x_max, y_max = box
+                if all(isinstance(coord, (int, float)) for coord in [x_min, y_min, x_max, y_max]):
+                    draw.rectangle([x_min, y_min, x_max, y_max], outline='red', width=2)
 
-    # Save the image with predictions
-    img_pil.save(save_path)
-    return image_tensor, prediction
+    return img_pil
 
 # Define the Flask app
 app = Flask(__name__)
@@ -76,13 +77,11 @@ app.config['UPLOAD_FOLDER'] = 'uploads/'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 # Load the trained model
-device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 model_path = 'model_epoch_7.pth'  # Change this to your model path
 model = load_trained_model(model_path=model_path, num_classes=2)
 
-
 @app.route('/upload', methods=['POST'])
-def upload_image():
+def upload_video():
     if 'file' not in request.files:
         return jsonify({'error': 'No file part'}), 400
     file = request.files['file']
@@ -93,10 +92,47 @@ def upload_image():
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(file_path)
 
-    save_path = os.path.join(app.config['UPLOAD_FOLDER'], 'output_with_bbox.jpg')
-    image_tensor, prediction = visualize_predictions(model, file_path, save_path)
+    # Read the video
+    cap = cv2.VideoCapture(file_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    return jsonify({'prediction': 'Garbage' if len(prediction[0]['boxes']) > 0 else 'No Garbage', 'output_image_path': save_path})
+    # Create a video writer
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    output_path = os.path.join(app.config['UPLOAD_FOLDER'], 'output_with_bbox.mp4')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    frame_number = 0
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Convert the frame to RGB
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Convert the frame to a tensor
+        image_tensor = F.to_tensor(frame_rgb).unsqueeze(0).to(device)
+
+        # Visualize predictions and print garbage detection status
+        img_pil = visualize_predictions(model, image_tensor, frame_number)
+
+        # Convert the PIL image back to OpenCV format
+        img_cv = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+        # Write the frame to the output video
+        out.write(img_cv)
+
+        frame_number += 1
+
+    cap.release()
+    out.release()
+
+    return jsonify({'prediction': 'Garbage detection completed', 'output_video_path': output_path})
 
 if __name__ == "__main__":
-    app.run(debug=True, port=8080, use_reloader=False)
+    import threading
+    def run_app():
+        app.run(debug=True, port=8080, use_reloader=False)
+    threading.Thread(target=run_app).start()
